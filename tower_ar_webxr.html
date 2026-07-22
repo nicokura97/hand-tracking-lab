@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Torre AR — anclada al piso real (WebXR)</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; color:#fff; font-family:system-ui,sans-serif; overflow:hidden; }
+  #score { position:fixed; top:calc(16px + env(safe-area-inset-top)); left:0; right:0; text-align:center;
+           font-size:22px; font-weight:800; text-shadow:0 2px 8px rgba(0,0,0,.85); pointer-events:none; }
+  #hint { position:fixed; bottom:calc(90px + env(safe-area-inset-bottom)); left:0; right:0; text-align:center;
+          font-size:14px; color:#dfe6f0; text-shadow:0 2px 6px rgba(0,0,0,.85); padding:0 24px; pointer-events:none; }
+  #unsupported { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+                 text-align:center; padding:28px; background:#07090f; }
+  #unsupported.hidden { display:none; }
+  #unsupported .big { font-size:20px; font-weight:800; margin-bottom:10px; }
+  #unsupported p { color:#b9c4d4; line-height:1.5; }
+</style>
+</head>
+<body>
+<div id="score"></div>
+<div id="hint">Apuntá al piso o a una mesa y tocá para anclar la torre</div>
+<div id="unsupported" class="hidden">
+  <div>
+    <div class="big">⚠️ Este navegador no soporta AR con anclaje real</div>
+    <p>Necesitás Chrome en Android (con ARCore). En iPhone/Safari todavía no está disponible.</p>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { ARButton } from "three/addons/webxr/ARButton.js";
+import * as CANNON from "cannon-es";
+
+const scoreEl = document.getElementById("score");
+const hintEl = document.getElementById("hint");
+const unsupportedEl = document.getElementById("unsupported");
+
+if (!navigator.xr) {
+  unsupportedEl.classList.remove("hidden");
+} else {
+  navigator.xr.isSessionSupported("immersive-ar").then(ok => { if (!ok) unsupportedEl.classList.remove("hidden"); });
+}
+
+// medidas en METROS REALES (WebXR usa escala 1:1 con el mundo, no unidades arbitrarias)
+const CUBE_SIZE = 0.12;
+const JITTER = 0.012;   // desvío horizontal al azar en cada cubo -> con la torre alta, se puede caer sola
+
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures:["hit-test"] }));
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 20);
+addEventListener("resize", () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+});
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.3));
+const key = new THREE.DirectionalLight(0xffffff, 1.3); key.position.set(0.5,1,0.3); scene.add(key);
+
+// anillo que muestra dónde vas a anclar la torre, antes de tocar
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI/2),
+  new THREE.MeshBasicMaterial({ color:0x6cf08a })
+);
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+// ---------- física (misma que ya probamos: gravedad, colisión, sin auto-alinear) ----------
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0,-9.82,0) });
+world.allowSleep = true;
+const cMat = new CANNON.Material("cube");
+world.defaultContactMaterial = new CANNON.ContactMaterial(cMat, cMat, { friction:0.5, restitution:0.05 });
+
+function makeBody(x,y,z,type,mass) {
+  const body = new CANNON.Body({ mass, type, material:cMat,
+    shape: new CANNON.Box(new CANNON.Vec3(CUBE_SIZE/2,CUBE_SIZE/2,CUBE_SIZE/2)) });
+  body.position.set(x,y,z);
+  body.linearDamping = 0.3; body.angularDamping = 0.4;
+  world.addBody(body);
+  return body;
+}
+function makeMesh(color) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(CUBE_SIZE,CUBE_SIZE,CUBE_SIZE),
+    new THREE.MeshStandardMaterial({ color, metalness:0.2, roughness:0.6 }));
+  m.add(new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry),
+    new THREE.LineBasicMaterial({ color:0xffffff, transparent:true, opacity:0.5 })));
+  return m;
+}
+
+let anchored = false, anchorX = 0, anchorZ = 0, stackTopY = 0, count = 0;
+const cubes = [];
+
+function placeAnchor(x, y, z) {
+  const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane(), material:cMat });
+  groundBody.quaternion.setFromEuler(-Math.PI/2, 0, 0);
+  groundBody.position.set(0, y, 0);
+  world.addBody(groundBody);
+
+  const body = makeBody(x, y + CUBE_SIZE/2, z, CANNON.Body.STATIC, 0);
+  const mesh = makeMesh(0x3f7fd0);
+  mesh.position.copy(body.position);
+  scene.add(mesh);
+  cubes.push({ mesh, body });
+
+  anchored = true; anchorX = x; anchorZ = z; stackTopY = y + CUBE_SIZE; count = 1;
+  scoreEl.textContent = "1 cubo";
+  hintEl.textContent = "Tocá la pantalla para agregar otro cubo — pasale el celular a otra persona si querés";
+}
+
+function addCube() {
+  const jx = anchorX + (Math.random()-0.5) * JITTER * 2;
+  const jz = anchorZ + (Math.random()-0.5) * JITTER * 2;
+  const body = makeBody(jx, stackTopY + CUBE_SIZE*1.6, jz, CANNON.Body.DYNAMIC, 0.05);
+  const mesh = makeMesh(new THREE.Color().setHSL(Math.random(), 0.55, 0.55));
+  scene.add(mesh);
+  cubes.push({ mesh, body });
+  stackTopY += CUBE_SIZE;
+  count++;
+  scoreEl.textContent = `${count} cubos`;
+}
+
+let hitTestSource = null, hitTestSourceRequested = false;
+
+const controller = renderer.xr.getController(0);
+controller.addEventListener("select", () => {
+  if (!anchored) {
+    if (reticle.visible) {
+      const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scale = new THREE.Vector3();
+      reticle.matrix.decompose(pos, quat, scale);
+      placeAnchor(pos.x, pos.y, pos.z);
+      reticle.visible = false;
+    }
+  } else {
+    addCube();
+  }
+});
+scene.add(controller);
+
+renderer.setAnimationLoop((timestamp, frame) => {
+  if (frame) {
+    const refSpace = renderer.xr.getReferenceSpace();
+    const session = renderer.xr.getSession();
+
+    if (!hitTestSourceRequested) {
+      session.requestReferenceSpace("viewer").then(viewerSpace => {
+        session.requestHitTestSource({ space: viewerSpace }).then(source => { hitTestSource = source; });
+      });
+      session.addEventListener("end", () => { hitTestSource = null; hitTestSourceRequested = false; });
+      hitTestSourceRequested = true;
+    }
+
+    if (hitTestSource && !anchored) {
+      const results = frame.getHitTestResults(hitTestSource);
+      if (results.length) {
+        const pose = results[0].getPose(refSpace);
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+      } else {
+        reticle.visible = false;
+      }
+    }
+  }
+
+  world.fixedStep();
+  for (const c of cubes) { c.mesh.position.copy(c.body.position); c.mesh.quaternion.copy(c.body.quaternion); }
+
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
