@@ -121,12 +121,26 @@ function makeMesh(color) {
 let anchored = false, anchorX = 0, anchorZ = 0, groundY = 0, stackTopY = 0, count = 0;
 const cubes = [];       // ya soltados -> la física los maneja
 let staging = null;     // { mesh, body } esperando en el piso, listo para agregar
+let carrying = false;   // true mientras sostenés el cubo con la pinza
+
+const GRAB_RADIUS = 0.25;   // qué tan cerca (en metros reales) tiene que apuntar tu mano al cubo para agarrarlo
+const groundRaycaster = new THREE.Raycaster();
+const groundPlane = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
+// dónde apunta tu mano en el mundo real, proyectada sobre el piso detectado (no hay forma de saber
+// la distancia real cámara->mano con una sola cámara, así que usamos el piso como referencia)
+function imagePointToGround(u, v) {
+  const ndc = new THREE.Vector2(u*2-1, -(v*2-1));
+  groundRaycaster.setFromCamera(ndc, camera);
+  const hit = new THREE.Vector3();
+  return groundRaycaster.ray.intersectPlane(groundPlane, hit) ? hit : null;
+}
 
 function placeAnchor(x, y, z) {
   const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane(), material:cMat });
   groundBody.quaternion.setFromEuler(-Math.PI/2, 0, 0);
   groundBody.position.set(0, y, 0);
   world.addBody(groundBody);
+  groundPlane.constant = -y;
 
   const body = makeBody(x, y + CUBE_SIZE/2, z, CANNON.Body.STATIC, 0);
   const mesh = makeMesh(0x3f7fd0);
@@ -145,14 +159,14 @@ function spawnStaging() {
   mesh.position.copy(body.position);
   scene.add(mesh);
   staging = { mesh, body };
-  hintEl.textContent = "Pinzá con una mano (o tocá la pantalla) para agregar el cubo amarillo a la torre";
+  hintEl.textContent = "Pinzá cerca del cubo amarillo para agarrarlo, movés la mano para llevarlo, soltás para apilarlo";
 }
 
-// tomar el cubo del piso y soltarlo (con física real) arriba de la torre
+// tomar el cubo del piso (desde donde lo hayas cargado) y soltarlo (con física real) arriba de la torre
 function promoteStaging() {
   if (!staging) return;
-  const jx = anchorX + (Math.random()-0.5) * JITTER * 2;
-  const jz = anchorZ + (Math.random()-0.5) * JITTER * 2;
+  const jx = staging.body.position.x + (Math.random()-0.5) * JITTER * 2;
+  const jz = staging.body.position.z + (Math.random()-0.5) * JITTER * 2;
   staging.body.position.set(jx, stackTopY + CUBE_SIZE*1.6, jz);
   staging.body.type = CANNON.Body.DYNAMIC;
   staging.body.mass = 0.05;
@@ -172,15 +186,12 @@ let hitTestSource = null, hitTestSourceRequested = false;
 
 const controller = renderer.xr.getController(0);
 controller.addEventListener("select", () => {
-  if (!anchored) {
-    if (reticle.visible) {
-      const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scale = new THREE.Vector3();
-      reticle.matrix.decompose(pos, quat, scale);
-      placeAnchor(pos.x, pos.y, pos.z);
-      reticle.visible = false;
-    }
-  } else {
-    promoteStaging();   // el toque queda como respaldo aunque la pinza funcione
+  // el toque SOLO ancla la torre la primera vez; agregar cubos es exclusivamente con la pinza
+  if (!anchored && reticle.visible) {
+    const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scale = new THREE.Vector3();
+    reticle.matrix.decompose(pos, quat, scale);
+    placeAnchor(pos.x, pos.y, pos.z);
+    reticle.visible = false;
   }
 });
 scene.add(controller);
@@ -283,15 +294,19 @@ function tryPinchFromCamera(frame, refSpace) {
   if (!texture) return;
   const w = view.camera.width, h = view.camera.height;
 
+  // OJO: en una sesión XR el framebuffer "real" NO es null -> hay que guardar el que estaba
+  // puesto y restaurar ESE, no asumir null (eso corrompía el render de ahí en más -> se veía
+  // "duplicado"/fantasma al mover, y de paso arruinaba la imagen que le pasábamos a MediaPipe).
+  const prevFB = gl.getParameter(gl.FRAMEBUFFER_BINDING);
   gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
   if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
     return;
   }
   const pixels = new Uint8Array(w*h*4);
   gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
   flipRowsY(pixels, w, h);
 
   camCanvas.width = w; camCanvas.height = h;
@@ -299,17 +314,35 @@ function tryPinchFromCamera(frame, refSpace) {
 
   const result = handLandmarker.detect(camCanvas);
   const hand = result.landmarks && result.landmarks[0];
-  if (!hand) { wasPinching = false; debugEl.textContent = "mano: no detectada"; return; }
+  if (!hand) { wasPinching = false; carrying = false; debugEl.textContent = "mano: no detectada"; return; }
 
-  drawHandOnPreview(hand, wasPinching ? "#ffd166" : "#6cf08a");
+  drawHandOnPreview(hand, carrying ? "#ffd166" : "#6cf08a");
 
   const ratio = pinchRatio(hand, result.worldLandmarks && result.worldLandmarks[0]);
   const threshold = wasPinching ? PINCH_OFF : PINCH_ON;   // histéresis: distinto umbral según el estado actual
   const pinching = ratio < threshold;
-  debugEl.textContent = `mano: detectada · ${pinching ? "pinzando" : "abierta"}`;
-  if (pinching && !wasPinching && now - lastTrigger > TRIGGER_COOLDOWN_MS) {
-    promoteStaging();
-    lastTrigger = now;
+
+  // punto de pinza (medio entre pulgar e índice) proyectado sobre el piso real
+  const pinchU = (hand[4].x + hand[8].x) / 2, pinchV = (hand[4].y + hand[8].y) / 2;
+  const groundPt = imagePointToGround(pinchU, pinchV);
+
+  if (!carrying) {
+    if (pinching && !wasPinching && groundPt && now - lastTrigger > TRIGGER_COOLDOWN_MS) {
+      const d = Math.hypot(groundPt.x - staging.body.position.x, groundPt.z - staging.body.position.z);
+      if (d < GRAB_RADIUS) { carrying = true; hintEl.textContent = "Llevalo arriba de la torre y soltá los dedos para apilarlo"; }
+    }
+    debugEl.textContent = `mano: detectada · ${pinching ? "pinzando" : "abierta"}`;
+  } else {
+    if (pinching && groundPt) {
+      staging.body.position.x = groundPt.x;
+      staging.body.position.z = groundPt.z;
+      staging.mesh.position.copy(staging.body.position);   // es STATIC -> no lo sincroniza el loop de física
+      debugEl.textContent = "mano: cargando el cubo…";
+    } else {
+      carrying = false;
+      lastTrigger = now;
+      promoteStaging();
+    }
   }
   wasPinching = pinching;
 }
