@@ -10,6 +10,8 @@
            font-size:22px; font-weight:800; text-shadow:0 2px 8px rgba(0,0,0,.85); pointer-events:none; }
   #hint { position:fixed; bottom:calc(90px + env(safe-area-inset-bottom)); left:0; right:0; text-align:center;
           font-size:14px; color:#dfe6f0; text-shadow:0 2px 6px rgba(0,0,0,.85); padding:0 24px; pointer-events:none; }
+  #debug { position:fixed; top:calc(48px + env(safe-area-inset-top)); left:0; right:0; text-align:center;
+           font-size:11px; color:#8fe0b0; text-shadow:0 2px 6px rgba(0,0,0,.85); pointer-events:none; }
   #unsupported { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
                  text-align:center; padding:28px; background:#07090f; }
   #unsupported.hidden { display:none; }
@@ -19,6 +21,7 @@
 </head>
 <body>
 <div id="score"></div>
+<div id="debug"></div>
 <div id="hint">Apuntá al piso o a una mesa y tocá para anclar la torre</div>
 <div id="unsupported" class="hidden">
   <div>
@@ -32,7 +35,8 @@
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js",
+    "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
   }
 }
 </script>
@@ -41,9 +45,11 @@
 import * as THREE from "three";
 import { ARButton } from "three/addons/webxr/ARButton.js";
 import * as CANNON from "cannon-es";
+import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
 const scoreEl = document.getElementById("score");
 const hintEl = document.getElementById("hint");
+const debugEl = document.getElementById("debug");
 const unsupportedEl = document.getElementById("unsupported");
 
 if (!navigator.xr) {
@@ -54,14 +60,20 @@ if (!navigator.xr) {
 
 // medidas en METROS REALES (WebXR usa escala 1:1 con el mundo, no unidades arbitrarias)
 const CUBE_SIZE = 0.12;
-const JITTER = 0.012;   // desvío horizontal al azar en cada cubo -> con la torre alta, se puede caer sola
+const JITTER = 0.012;       // desvío horizontal al azar en cada cubo -> con la torre alta, se puede caer sola
+const STAGE_OFFSET = 0.22;  // a qué distancia del ancla aparece el próximo cubo, sobre el piso real
+const PINCH_ON = 0.55;      // umbral de pinza (distancia 3D pulgar-índice / tamaño de mano)
 
 const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 document.body.appendChild(renderer.domElement);
-document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures:["hit-test"] }));
+document.body.appendChild(ARButton.createButton(renderer, {
+  requiredFeatures: ["hit-test"],
+  optionalFeatures: ["camera-access", "dom-overlay"],
+  domOverlay: { root: document.body }
+}));
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 20);
@@ -104,8 +116,9 @@ function makeMesh(color) {
   return m;
 }
 
-let anchored = false, anchorX = 0, anchorZ = 0, stackTopY = 0, count = 0;
-const cubes = [];
+let anchored = false, anchorX = 0, anchorZ = 0, groundY = 0, stackTopY = 0, count = 0;
+const cubes = [];       // ya soltados -> la física los maneja
+let staging = null;     // { mesh, body } esperando en el piso, listo para agregar
 
 function placeAnchor(x, y, z) {
   const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane(), material:cMat });
@@ -119,21 +132,38 @@ function placeAnchor(x, y, z) {
   scene.add(mesh);
   cubes.push({ mesh, body });
 
-  anchored = true; anchorX = x; anchorZ = z; stackTopY = y + CUBE_SIZE; count = 1;
+  anchored = true; anchorX = x; anchorZ = z; groundY = y; stackTopY = y + CUBE_SIZE; count = 1;
   scoreEl.textContent = "1 cubo";
-  hintEl.textContent = "Tocá la pantalla para agregar otro cubo — pasale el celular a otra persona si querés";
+  spawnStaging();
 }
 
-function addCube() {
+function spawnStaging() {
+  const mesh = makeMesh(0xffd166);
+  const body = makeBody(anchorX + STAGE_OFFSET, groundY + CUBE_SIZE/2, anchorZ, CANNON.Body.STATIC, 0);
+  mesh.position.copy(body.position);
+  scene.add(mesh);
+  staging = { mesh, body };
+  hintEl.textContent = "Pinzá con una mano (o tocá la pantalla) para agregar el cubo amarillo a la torre";
+}
+
+// tomar el cubo del piso y soltarlo (con física real) arriba de la torre
+function promoteStaging() {
+  if (!staging) return;
   const jx = anchorX + (Math.random()-0.5) * JITTER * 2;
   const jz = anchorZ + (Math.random()-0.5) * JITTER * 2;
-  const body = makeBody(jx, stackTopY + CUBE_SIZE*1.6, jz, CANNON.Body.DYNAMIC, 0.05);
-  const mesh = makeMesh(new THREE.Color().setHSL(Math.random(), 0.55, 0.55));
-  scene.add(mesh);
-  cubes.push({ mesh, body });
+  staging.body.position.set(jx, stackTopY + CUBE_SIZE*1.6, jz);
+  staging.body.type = CANNON.Body.DYNAMIC;
+  staging.body.mass = 0.05;
+  staging.body.updateMassProperties();
+  staging.body.velocity.set(0,0,0);
+  staging.body.angularVelocity.set(0,0,0);
+  staging.body.wakeUp();
+  cubes.push(staging);
   stackTopY += CUBE_SIZE;
   count++;
   scoreEl.textContent = `${count} cubos`;
+  staging = null;
+  spawnStaging();
 }
 
 let hitTestSource = null, hitTestSourceRequested = false;
@@ -148,10 +178,106 @@ controller.addEventListener("select", () => {
       reticle.visible = false;
     }
   } else {
-    addCube();
+    promoteStaging();   // el toque queda como respaldo aunque la pinza funcione
   }
 });
 scene.add(controller);
+
+// ---------- EXPERIMENTAL: leer la cámara real de la sesión AR y pasarla a MediaPipe ----------
+// para detectar la pinza de una mano. Si algo de esto falla (el feature no está disponible,
+// el navegador no lo soporta, etc.) el juego sigue funcionando con el toque en pantalla.
+let glBinding = null, handLandmarker = null;
+let camCanvas = null, camCtx = null, fb = null;
+let lastPinchCheck = 0, wasPinching = false;
+const PINCH_INTERVAL_MS = 130;   // no correr esto cada cuadro -> es una lectura de GPU cara
+
+function pinchRatio(lm, wl) {
+  if (wl) {
+    const d = (a,b) => Math.hypot(wl[a].x-wl[b].x, wl[a].y-wl[b].y, wl[a].z-wl[b].z);
+    return d(4,8) / (d(0,9) || 1e-6);
+  }
+  const size = Math.hypot(lm[0].x-lm[9].x, lm[0].y-lm[9].y) || 1e-6;
+  return Math.hypot(lm[4].x-lm[8].x, lm[4].y-lm[8].y) / size;
+}
+
+FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm")
+  .then(vision => HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "IMAGE", numHands: 1
+  }))
+  .then(hl => { handLandmarker = hl; debugEl.textContent = "mano: modelo listo"; })
+  .catch(e => { debugEl.textContent = "mano: no se pudo cargar el modelo"; console.error(e); });
+
+renderer.xr.addEventListener("sessionstart", () => {
+  try {
+    const session = renderer.xr.getSession();
+    const gl = renderer.getContext();
+    glBinding = new XRWebGLBinding(session, gl);
+    fb = gl.createFramebuffer();
+    camCanvas = document.createElement("canvas");
+    camCtx = camCanvas.getContext("2d", { willReadFrequently: true });
+    debugEl.textContent = "cámara AR: binding ok";
+  } catch (e) {
+    glBinding = null;
+    debugEl.textContent = "cámara AR: no disponible (queda solo el toque)";
+    console.error(e);
+  }
+});
+renderer.xr.addEventListener("sessionend", () => { glBinding = null; });
+
+function flipRowsY(pixels, width, height) {
+  const rowBytes = width*4, tmp = new Uint8Array(rowBytes);
+  for (let y=0; y<height/2; y++) {
+    const top=y*rowBytes, bottom=(height-1-y)*rowBytes;
+    tmp.set(pixels.subarray(top, top+rowBytes));
+    pixels.copyWithin(top, bottom, bottom+rowBytes);
+    pixels.set(tmp, bottom);
+  }
+}
+
+function tryPinchFromCamera(frame, refSpace) {
+  if (!glBinding || !handLandmarker || !staging) return;
+  const now = performance.now();
+  if (now - lastPinchCheck < PINCH_INTERVAL_MS) return;
+  lastPinchCheck = now;
+
+  const pose = frame.getViewerPose(refSpace);
+  if (!pose) return;
+  const view = pose.views.find(v => v.camera);
+  if (!view) { debugEl.textContent = "cámara AR: feature no concedido"; return; }
+
+  const gl = renderer.getContext();
+  const texture = glBinding.getCameraImage(view.camera);
+  if (!texture) return;
+  const w = view.camera.width, h = view.camera.height;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return;
+  }
+  const pixels = new Uint8Array(w*h*4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  flipRowsY(pixels, w, h);
+
+  camCanvas.width = w; camCanvas.height = h;
+  camCtx.putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer), w, h), 0, 0);
+
+  const result = handLandmarker.detect(camCanvas);
+  const hand = result.landmarks && result.landmarks[0];
+  if (!hand) { wasPinching = false; debugEl.textContent = "mano: no detectada"; return; }
+
+  const ratio = pinchRatio(hand, result.worldLandmarks && result.worldLandmarks[0]);
+  const pinching = ratio < PINCH_ON;
+  debugEl.textContent = `mano: detectada · ${pinching ? "pinzando" : "abierta"}`;
+  if (pinching && !wasPinching) promoteStaging();   // flanco de subida: recién al cerrar dispara, no mientras se sostiene
+  wasPinching = pinching;
+}
 
 renderer.setAnimationLoop((timestamp, frame) => {
   if (frame) {
@@ -175,6 +301,11 @@ renderer.setAnimationLoop((timestamp, frame) => {
       } else {
         reticle.visible = false;
       }
+    }
+
+    if (anchored) {
+      try { tryPinchFromCamera(frame, refSpace); }
+      catch (e) { debugEl.textContent = "mano: error de lectura (queda el toque)"; console.error(e); }
     }
   }
 
