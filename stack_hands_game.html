@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Torre — apilá cubos con las dos manos</title>
+<style>
+  html, body { margin:0; height:100%; background:#07090f; color:#e6e6e6;
+               font-family: system-ui, sans-serif; overflow:hidden; }
+  #wrap { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; }
+  #stage { position:relative; background:#000; box-shadow:0 0 60px rgba(0,0,0,.8); }
+  #stage > * { position:absolute; inset:0; width:100%; height:100%; }
+  video { object-fit:fill; transform:scaleX(-1); opacity:0; }
+  canvas { pointer-events:none; }
+  #hud { position:absolute; top:12px; left:0; right:0; text-align:center; pointer-events:none; }
+  #score { font-size:28px; font-weight:800; text-shadow:0 2px 6px rgba(0,0,0,.6); }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+         text-align:center; pointer-events:none; }
+  #msg .box { background:rgba(0,0,0,.55); padding:18px 26px; border-radius:14px; font-size:18px;
+              line-height:1.5; max-width:80%; }
+  #msg.hidden { display:none; }
+  #status { position:absolute; bottom:10px; right:10px; font-size:12px; color:#9fd;
+            background:rgba(0,0,0,.5); padding:6px 10px; border-radius:6px; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="gl"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="hud"><div id="score">1 cubo</div></div>
+    <div id="msg"><div class="box">
+      <div class="big" style="font-size:30px;font-weight:800;margin-bottom:6px;">🧱 Apilá con las dos manos</div>
+      El cubo amarillo de la izquierda es el que tenés que mover<br/>
+      Pinzá con pulgar+índice de <b>las dos manos</b> sobre él, llevalo arriba de la torre y soltá
+    </div></div>
+    <div id="status">cargando…</div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const octx = overlay.getContext("2d");
+const stage = document.getElementById("stage");
+const scoreEl = document.getElementById("score");
+const msgEl = document.getElementById("msg");
+const statusEl = document.getElementById("status");
+
+const CAM_W = 960, CAM_H = 720, ASPECT = CAM_W / CAM_H;
+
+// ---------- ajustes de sensación ----------
+const CUBE_SIZE = 1.0;
+const GRAB_ON = 0.50, GRAB_OFF = 0.78;     // umbrales de pinza 3D (igual que el cubo que ya andaba bien)
+const REACH = 1.1;                         // qué tan cerca del cubo tiene que estar cada mano para agarrar
+const CARRY_SMOOTH = 0.35;
+const PLACE_TOLERANCE = 0.55;              // margen horizontal permitido al soltar (bastante amplio)
+const STAGE_X = -3.2;
+
+function pinchRatio(lm, wl) {
+  if (wl) {
+    const d = (a,b) => Math.hypot(wl[a].x-wl[b].x, wl[a].y-wl[b].y, wl[a].z-wl[b].z);
+    return d(4,8) / (d(0,9) || 1e-6);
+  }
+  const size = Math.hypot(lm[0].x-lm[9].x, lm[0].y-lm[9].y) || 1e-6;
+  return Math.hypot(lm[4].x-lm[8].x, lm[4].y-lm[8].y) / size;
+}
+
+// ---------- escena ----------
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("gl"), antialias:true });
+renderer.setPixelRatio(window.devicePixelRatio);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xaed9ff);
+scene.fog = new THREE.Fog(0xaed9ff, 14, 45);
+const camera = new THREE.PerspectiveCamera(55, ASPECT, 0.1, 100);
+camera.position.set(0, 4.4, 8.5);
+camera.lookAt(0, 3, 0);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x9fb98c, 1.8));
+const key = new THREE.DirectionalLight(0xffffff, 1.6); key.position.set(3,8,4); scene.add(key);
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(60,60),
+  new THREE.MeshStandardMaterial({ color:0x8fbf6a, roughness:0.9 }));
+ground.rotation.x = -Math.PI/2;
+scene.add(ground);
+scene.add(new THREE.GridHelper(60, 24, 0xffffff, 0xdfe9c8));
+
+function layout() {
+  let w = innerWidth, h = innerHeight;
+  if (w/h > ASPECT) w = h*ASPECT; else h = w/ASPECT;
+  stage.style.width = w+"px"; stage.style.height = h+"px";
+  renderer.setSize(w,h,false);
+  camera.aspect = ASPECT; camera.updateProjectionMatrix();
+  overlay.width = w*devicePixelRatio; overlay.height = h*devicePixelRatio;
+  octx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+}
+addEventListener("resize", layout); layout();
+
+// mano (pantalla, 0..1 ya espejado) -> mundo 3D real, intersectando el plano z=0.
+// Con raycasting real no importa el ángulo/altura de la cámara (a diferencia del
+// mapeo lineal que usábamos antes, que solo servía con cámara mirando derecho).
+const raycaster = new THREE.Raycaster();
+const groundPlaneZ = new THREE.Plane(new THREE.Vector3(0,0,1), 0);
+const _hit = new THREE.Vector3();
+function toWorld(mx, my) {
+  raycaster.setFromCamera(new THREE.Vector2(mx*2-1, -(my*2-1)), camera);
+  raycaster.ray.intersectPlane(groundPlaneZ, _hit);
+  return { x: _hit.x, y: _hit.y };
+}
+const toPx = (mx,my) => ({ x: mx*stage.clientWidth, y: my*stage.clientHeight });
+
+// ---------- torre ----------
+function makeCube(color) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(CUBE_SIZE,CUBE_SIZE,CUBE_SIZE),
+    new THREE.MeshStandardMaterial({ color, metalness:0.25, roughness:0.5 }));
+  mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry),
+    new THREE.LineBasicMaterial({ color:0xffffff, transparent:true, opacity:0.5 })));
+  return mesh;
+}
+let stackTopY = 0, placedCount = 1;
+const base = makeCube(0x3f7fd0);
+base.position.set(0, CUBE_SIZE/2, 0);
+scene.add(base);
+stackTopY = CUBE_SIZE;
+
+let staging = null;   // { mesh, grabbed }
+function spawnStaging() {
+  const mesh = makeCube(0xffd166);
+  mesh.position.set(STAGE_X, stackTopY + CUBE_SIZE*0.6 + 0.3, 0);
+  scene.add(mesh);
+  staging = { mesh, grabbed:false };
+}
+spawnStaging();
+
+function tryPlace() {
+  const dx = Math.abs(staging.mesh.position.x - 0);
+  const highEnough = staging.mesh.position.y > stackTopY;
+  if (dx < PLACE_TOLERANCE && highEnough) {
+    staging.mesh.position.set(0, stackTopY + CUBE_SIZE/2, 0);
+    stackTopY += CUBE_SIZE; placedCount++;
+    scoreEl.textContent = `${placedCount} cubos`;
+  } else {
+    scene.remove(staging.mesh); staging.mesh.geometry.dispose(); staging.mesh.material.dispose();
+  }
+  staging = null;
+  spawnStaging();
+}
+
+// ---------- manos ----------
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]
+];
+function drawHand(lm, color) {
+  octx.strokeStyle = color; octx.lineWidth = 3; octx.globalAlpha = 0.85;
+  for (const [a,b] of HAND_CONNECTIONS) {
+    const p = toPx(1-lm[a].x, lm[a].y), q = toPx(1-lm[b].x, lm[b].y);
+    octx.beginPath(); octx.moveTo(p.x,p.y); octx.lineTo(q.x,q.y); octx.stroke();
+  }
+  octx.globalAlpha = 1; octx.fillStyle = color;
+  for (const l of lm) { const p = toPx(1-l.x,l.y); octx.beginPath(); octx.arc(p.x,p.y,3.5,0,Math.PI*2); octx.fill(); }
+}
+
+function render() { requestAnimationFrame(render); renderer.render(scene, camera); }
+render();
+
+async function main() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const landmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                  delegate:"GPU" },
+    runningMode:"VIDEO", numHands:2 });
+
+  video.srcObject = await navigator.mediaDevices.getUserMedia({
+    video:{ width:CAM_W, height:CAM_H }, audio:false });
+  await new Promise(r => video.onloadedmetadata = r);
+  video.play(); layout();
+  statusEl.textContent = "listo";
+
+  let last = -1;
+  function loop() {
+    if (video.currentTime !== last) {
+      last = video.currentTime;
+      const res = landmarker.detectForVideo(video, performance.now());
+      octx.clearRect(0,0,stage.clientWidth, stage.clientHeight);
+
+      const wls = res.worldLandmarks || [];
+      const hands = (res.landmarks || []).map((lm,i) => {
+        const pinchN = pinchRatio(lm, wls[i]);
+        const mx = 1-(lm[4].x+lm[8].x)/2, my = (lm[4].y+lm[8].y)/2;
+        return { lm, pinchN, world: toWorld(mx,my) };
+      });
+
+      if (staging) {
+        if (!staging.grabbed) {
+          const near = hands.filter(h => h.pinchN < GRAB_ON &&
+            Math.hypot(h.world.x-staging.mesh.position.x, h.world.y-staging.mesh.position.y) < REACH);
+          if (near.length >= 2) { staging.grabbed = true; msgEl.classList.add("hidden"); }
+        } else {
+          const holding = hands.filter(h => h.pinchN < GRAB_OFF);
+          if (holding.length >= 2) {
+            const [a,b] = holding;
+            const midX = (a.world.x+b.world.x)/2, midY = (a.world.y+b.world.y)/2;
+            staging.mesh.position.x += (midX - staging.mesh.position.x)*CARRY_SMOOTH;
+            staging.mesh.position.y += (midY - staging.mesh.position.y)*CARRY_SMOOTH;
+          } else {
+            tryPlace();
+          }
+        }
+      }
+
+      for (const h of hands) {
+        const gripping = staging && staging.grabbed;
+        drawHand(h.lm, gripping ? "#6cf08a" : h.pinchN < GRAB_ON ? "#ffd166" : "#7fd4ff");
+      }
+
+      if (hands.length < 2) statusEl.textContent = "mostrá las dos manos";
+      else if (staging && !staging.grabbed) statusEl.textContent = "pinzá el cubo amarillo con las dos manos";
+      else statusEl.textContent = "";
+    }
+    requestAnimationFrame(loop);
+  }
+  loop();
+}
+
+main().catch(e => { statusEl.textContent = "error: "+e.message; console.error(e); });
+</script>
+</body>
+</html>

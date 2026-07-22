@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Hand Tracking Lab</title>
+<style>
+  html, body { margin:0; min-height:100%; background:#07090f; color:#e6e6e6;
+               font-family: system-ui, sans-serif; }
+  .wrap { max-width:520px; margin:0 auto; padding:32px 20px; }
+  h1 { font-size:22px; margin-bottom:4px; }
+  p.sub { color:#9aa4b5; margin-top:0; font-size:14px; }
+  a.card { display:block; background:#12151d; border:1px solid #232838; border-radius:12px;
+           padding:16px 18px; margin-bottom:12px; text-decoration:none; color:#e6e6e6; }
+  a.card:active { background:#181c28; }
+  a.card b { display:block; font-size:16px; color:#7fd4ff; margin-bottom:4px; }
+  a.card span { font-size:13px; color:#b9c4d4; }
+  .note { font-size:12px; color:#6b7686; margin-top:20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🖐️ Hand Tracking Lab</h1>
+  <p class="sub">Experimentos de control por cámara + MediaPipe + Three.js. Requiere cámara y navegador con WebGL.</p>
+
+  <a class="card" href="hand_control_test.html">
+    <b>Cubo 3D — sketch / extrude / cut / round / draw</b>
+    <span>Agarrar, rotar, escalar y editar un cubo con las manos.</span>
+  </a>
+  <a class="card" href="wheel_dodge_game.html">
+    <b>Volante — esquivá con las dos manos</b>
+    <span>Manejá un volante invisible para esquivar conos.</span>
+  </a>
+  <a class="card" href="stack_hands_game.html">
+    <b>Torre (con ayuda) — apilá cubos</b>
+    <span>Agarrá y colocá cubos; se alinean solos.</span>
+  </a>
+  <a class="card" href="stack_physics_ar.html">
+    <b>Torre AR — física real</b>
+    <span>Cámara de fondo visible, sin auto-alinear, física real (cannon-es).</span>
+  </a>
+
+  <p class="note">Estos demos piden permiso de cámara — tiene que ser por HTTPS (GitHub Pages ya lo es).</p>
+</div>
+</body>
+</html>

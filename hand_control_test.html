@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Cubo 3D con las manos — sketch / extrude / cut / round / draw</title>
+<style>
+  html, body { margin:0; height:100%; background:#07090f; color:#e6e6e6;
+               font-family: system-ui, sans-serif; overflow:hidden; }
+  #wrap { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; }
+  #stage { position:relative; background:#000; box-shadow:0 0 60px rgba(0,0,0,.8); }
+  #stage > * { position:absolute; inset:0; width:100%; height:100%; }
+  video { object-fit:fill; transform:scaleX(-1); transition:opacity .25s; }
+  video.hidden-cam { opacity:0; }
+  canvas { pointer-events:none; }
+  #state { position:absolute; inset:auto auto 12px 12px; width:auto; height:auto;
+           font-size:14px; font-weight:600; background:rgba(0,0,0,.45); padding:7px 13px;
+           border-radius:20px; pointer-events:none; white-space:nowrap; }
+  #hud { position:absolute; inset:auto 12px 12px auto; width:auto; height:auto;
+         font-size:12px; line-height:1.5; color:#b9c4d4; background:rgba(0,0,0,.4);
+         padding:8px 12px; border-radius:8px; pointer-events:none; text-align:right; }
+  #hud.off { display:none; }
+  #hud b { color:#7fd4ff; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="gl"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="state">cargando…</div>
+    <div id="hud">
+      <b>1 mano:</b> pinza = el cubo sigue tu mano (girá la muñeca)<br/>
+      <b>2 manos:</b> separar/juntar = estirar · mover = girar<br/>
+      <b>Índice:</b> tocá una cara/arista o un botón (responden al toque, sin espera)<br/>
+      <b>CIRCLE/SQUARE:</b> con una cara elegida, croquis centrado — EXTRUDE/CUT actúan solo ahí<br/>
+      <b>ROUND:</b> tocá una arista, después pinza y arrastrá para redondearla<br/>
+      <b>DRAW:</b> el modelo se congela · apuntá con el índice y arrastrá · tocá DRAW de nuevo para borrar todo<br/>
+      <span style="opacity:.6">H ayuda · R reset · ESC salir del modo · V oculta la cámara</span>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+const video   = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const octx    = overlay.getContext("2d");
+const stage   = document.getElementById("stage");
+const stateEl = document.getElementById("state");
+const hudEl   = document.getElementById("hud");
+
+const CAM_W = 960, CAM_H = 720, ASPECT = CAM_W / CAM_H;
+
+const GRAB_ON = 0.50, GRAB_OFF = 0.78, GRACE_MS = 400;   // umbrales de pinza 3D
+const REACH_PAD = 0.75, ROT_GAIN = 1.35, TWO_GAIN = 1.6;
+const DEADZONE = 0.004, SMOOTH = 0.45, TAP_MS = 350;
+const DIM_MIN = 0.08, DIM_MAX = 3.5, DRAG_GAIN = 0.8;
+const SKETCH_R = 0.30, BOSS_MAX = 1.5;
+const TIP_SMOOTH = 0.30, DRAW_GRACE_MS = 150, DRAW_MIN_DIST = 3.5;
+
+// pinza medida en 3D métrico (worldLandmarks) -> NO se distorsiona con la distancia
+// a la cámara, a diferencia de la distancia 2D en pantalla. Fallback a 2D si no hay 3D.
+function pinchRatio(lm, wl) {
+  if (wl) {
+    const d = (a,b) => Math.hypot(wl[a].x-wl[b].x, wl[a].y-wl[b].y, wl[a].z-wl[b].z);
+    return d(4,8) / (d(0,9) || 1e-6);
+  }
+  const size = Math.hypot(lm[0].x-lm[9].x, lm[0].y-lm[9].y) || 1e-6;
+  return Math.hypot(lm[4].x-lm[8].x, lm[4].y-lm[8].y) / size;
+}
+
+// ---------- escena ----------
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("gl"), antialias:true, alpha:true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearAlpha(0);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, ASPECT, 0.1, 100);
+camera.position.set(0, 0, 4);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x223044, 1.3));
+const key = new THREE.DirectionalLight(0xffffff, 1.4); key.position.set(3,4,5); scene.add(key);
+const rim = new THREE.DirectionalLight(0x66aaff, 0.9); rim.position.set(-4,-2,2); scene.add(rim);
+
+// ---------- modo estudio: grilla + fondo, en vez de tu cámara de fondo ----------
+const studioBg = new THREE.Color(0x0b0e15);
+const studioFog = new THREE.Fog(0x0b0e15, 3.2, 8.5);
+const grid = new THREE.GridHelper(8, 24, 0x3a6ea8, 0x172436);
+grid.position.y = -1.35; grid.visible = false;
+grid.material.transparent = true; grid.material.opacity = 0.7;
+scene.add(grid);
+const floorGlow = new THREE.PointLight(0x3f7fd0, 0, 6);
+floorGlow.position.set(0, -1, 1.5); scene.add(floorGlow);
+
+let camHidden = false;
+function setCamHidden(hidden) {
+  camHidden = hidden;
+  video.classList.toggle("hidden-cam", hidden);
+  grid.visible = hidden;
+  scene.background = hidden ? studioBg : null;
+  scene.fog = hidden ? studioFog : null;
+  floorGlow.intensity = hidden ? 1.6 : 0;
+  renderer.setClearAlpha(hidden ? 1 : 0);
+}
+
+const FACE_NAMES   = ["derecha","izquierda","arriba","abajo","frente","atrás"];
+const FACE_NORMALS = [new THREE.Vector3(1,0,0), new THREE.Vector3(-1,0,0),
+                      new THREE.Vector3(0,1,0), new THREE.Vector3(0,-1,0),
+                      new THREE.Vector3(0,0,1), new THREE.Vector3(0,0,-1)];
+const FACE_AXIS = ["x","x","y","y","z","z"];
+const FACE_SIGN = [ 1, -1, 1, -1, 1, -1];
+
+const faceMats = FACE_NAMES.map(() => new THREE.MeshStandardMaterial({
+  color:0x3f7fd0, metalness:0.35, roughness:0.35, transparent:true, opacity:0.92 }));
+const cube = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), faceMats);
+scene.add(cube);
+cube.add(new THREE.LineSegments(new THREE.EdgesGeometry(cube.geometry),
+  new THREE.LineBasicMaterial({ color:0xbfe4ff })));
+
+const visH = 2*Math.tan(THREE.MathUtils.degToRad(50)/2)*camera.position.z;
+const visW = visH*ASPECT;
+
+function layout() {
+  let w = innerWidth, h = innerHeight;
+  if (w/h > ASPECT) w = h*ASPECT; else h = w/ASPECT;
+  stage.style.width = w+"px"; stage.style.height = h+"px";
+  renderer.setSize(w,h,false);
+  overlay.width = w*devicePixelRatio; overlay.height = h*devicePixelRatio;
+  octx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+}
+addEventListener("resize", layout); layout();
+
+const toWorld = (mx,my) => ({ x:(mx-0.5)*visW, y:(0.5-my)*visH });
+const toPx    = (mx,my) => ({ x: mx*stage.clientWidth, y: my*stage.clientHeight });
+const worldToPx = v => ({ x:(v.x/visW+0.5)*stage.clientWidth, y:(0.5-v.y/visH)*stage.clientHeight });
+
+// ---------- estado del cubo ----------
+const objQuat = new THREE.Quaternion();
+let objScale = 1, shownScale = 1;
+const dims   = { x:1, y:1, z:1 };
+const offset = { x:0, y:0, z:0 };
+let selectedFace = -1, hoverFace = -1, mode = null;   // mode: null | "extrude" | "cut" | "round"
+let dragRef = null;
+
+// ---------- estado de croquis (sketch) + feature (boss/pocket) ----------
+let sketchShape = null;      // null | "circle" | "square"
+let sketchMesh  = null;      // contorno del croquis, hijo de cube
+let featureMesh = null;      // boss (sólido, crece afuera) o cavidad del pocket (hijo de cube)
+let frameMesh   = null;      // marco con agujero que reemplaza visualmente la cara ocultada por el pocket
+let featureKind = null;      // "boss" | "pocket"
+let featureFace = -1, featureShape = null, featureDepth = 0.02;
+let hiddenFace  = -1;        // cara original oculta mientras hay un pocket activo en esa cara
+
+// ---------- estado de aristas redondeadas (ROUND) ----------
+let selectedEdge = -1, hoverEdge = -1;
+let filletMesh = null, filletRadius = 0.02;
+let edgePickers = null;
+
+// ---------- estado de dibujo ----------
+let drawing = false;
+const strokes = [];
+const activePen = new Map();
+const penLostAt = new Map();
+
+const AX = new THREE.Vector3(1,0,0), AY = new THREE.Vector3(0,1,0), AZ = new THREE.Vector3(0,0,1);
+function spin(axis, angle){ if (Math.abs(angle)<1e-5) return;
+  objQuat.premultiply(new THREE.Quaternion().setFromAxisAngle(axis, angle)); }
+const dz = v => Math.abs(v) < DEADZONE ? 0 : v;
+function angleDelta(a,b){ let d=a-b; while(d>Math.PI)d-=Math.PI*2; while(d<-Math.PI)d+=Math.PI*2; return d; }
+
+// ---------- geometría de cara: base ortonormal + ejes tangentes ----------
+function faceBasis(face) {
+  const n = FACE_NORMALS[face].clone();
+  const ref = Math.abs(n.y) > 0.9 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
+  const xAxis = new THREE.Vector3().crossVectors(ref, n).normalize();
+  const yAxis = new THREE.Vector3().crossVectors(n, xAxis).normalize();
+  return { xAxis, yAxis, zAxis:n };
+}
+function faceQuat(face) {
+  const { xAxis, yAxis, zAxis } = faceBasis(face);
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis));
+}
+const axisNameOf = v => Math.abs(v.x) > 0.5 ? "x" : Math.abs(v.y) > 0.5 ? "y" : "z";
+
+function buildToolGeometry(shape) {
+  if (shape === "circle") { const g = new THREE.CylinderGeometry(SKETCH_R, SKETCH_R, 1, 28); g.rotateX(Math.PI/2); return g; }
+  return new THREE.BoxGeometry(SKETCH_R*2, SKETCH_R*2, 1);
+}
+function buildSketchOutline(shape) {
+  const pts = [];
+  if (shape === "circle") { for (let i=0;i<=40;i++){ const a=(i/40)*Math.PI*2; pts.push(new THREE.Vector3(Math.cos(a)*SKETCH_R, Math.sin(a)*SKETCH_R, 0)); } }
+  else { const s=SKETCH_R; pts.push(new THREE.Vector3(-s,-s,0), new THREE.Vector3(s,-s,0), new THREE.Vector3(s,s,0), new THREE.Vector3(-s,s,0), new THREE.Vector3(-s,-s,0)); }
+  return new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color:0x6cf08a }));
+}
+// marco plano con un agujero (círculo o cuadrado) -> reemplaza la cara oculta por el pocket.
+// Geometría 100% nativa de three.js (Shape + hole), sin librerías externas.
+function buildFrameGeometry(shape, w, h) {
+  const outer = new THREE.Shape();
+  outer.moveTo(-w/2,-h/2); outer.lineTo(w/2,-h/2); outer.lineTo(w/2,h/2); outer.lineTo(-w/2,h/2); outer.closePath();
+  const hole = new THREE.Path();
+  if (shape === "circle") hole.absellipse(0, 0, SKETCH_R, SKETCH_R, 0, Math.PI*2, true, 0);
+  else { const s = SKETCH_R; hole.moveTo(-s,-s); hole.lineTo(-s,s); hole.lineTo(s,s); hole.lineTo(s,-s); hole.closePath(); }
+  outer.holes.push(hole);
+  return new THREE.ShapeGeometry(outer, 32);
+}
+function clearSketchMesh() {
+  if (sketchMesh) { cube.remove(sketchMesh); sketchMesh.geometry.dispose(); sketchMesh.material.dispose(); sketchMesh = null; }
+}
+function updateSketchMesh() {
+  clearSketchMesh();
+  if (sketchShape && selectedFace >= 0) {
+    sketchMesh = buildSketchOutline(sketchShape);
+    sketchMesh.quaternion.copy(faceQuat(selectedFace));
+    sketchMesh.position.copy(FACE_NORMALS[selectedFace]).multiplyScalar(0.503);
+    cube.add(sketchMesh);
+  }
+}
+// la cara original de la caja se OCULTA donde hay un pocket -> si no, su superficie
+// queda exactamente coincidente con la del marco y las dos "pelean" por pintarse (glitch/parpadeo)
+function hideOriginalFace(face) { const m = faceMats[face]; m.opacity = 0; m.depthWrite = false; }
+function restoreOriginalFace(face) { if (face < 0) return; const m = faceMats[face]; m.opacity = 0.92; m.depthWrite = true; }
+
+function clearFeatureMesh() {
+  if (featureMesh) { cube.remove(featureMesh); featureMesh.geometry.dispose(); featureMesh.material.dispose(); featureMesh = null; }
+  if (frameMesh) { cube.remove(frameMesh); frameMesh.geometry.dispose(); frameMesh.material.dispose(); frameMesh = null; }
+  restoreOriginalFace(hiddenFace); hiddenFace = -1;
+  featureKind = null; featureFace = -1; featureShape = null;
+}
+function ensureFeatureMesh(kind) {
+  if (featureMesh && featureKind === kind && featureFace === selectedFace && featureShape === sketchShape) return;
+  clearFeatureMesh();
+  const geo = buildToolGeometry(sketchShape);
+  const mat = new THREE.MeshStandardMaterial({
+    color: kind === "boss" ? 0x3f7fd0 : 0x18202c, metalness:0.3, roughness:0.5,
+    side: kind === "boss" ? THREE.FrontSide : THREE.DoubleSide });
+  featureMesh = new THREE.Mesh(geo, mat);
+  featureMesh.quaternion.copy(faceQuat(selectedFace));
+  cube.add(featureMesh);
+  featureKind = kind; featureFace = selectedFace; featureShape = sketchShape;
+
+  if (kind === "pocket") {
+    const { xAxis, yAxis } = faceBasis(selectedFace);
+    const w = dims[axisNameOf(xAxis)] * 1.02, h = dims[axisNameOf(yAxis)] * 1.02;
+    frameMesh = new THREE.Mesh(buildFrameGeometry(sketchShape, w, h),
+      new THREE.MeshStandardMaterial({ color:0x3f7fd0, metalness:0.35, roughness:0.35, side:THREE.DoubleSide }));
+    frameMesh.quaternion.copy(faceQuat(selectedFace));
+    frameMesh.position.copy(FACE_NORMALS[selectedFace]).multiplyScalar(0.501);
+    cube.add(frameMesh);
+    hiddenFace = selectedFace;
+    hideOriginalFace(selectedFace);
+  }
+}
+function setFeatureDepth(depth) {
+  featureDepth = depth;
+  featureMesh.scale.z = Math.max(depth, 0.001);
+  const dir = featureKind === "boss" ? 1 : -1;
+  featureMesh.position.copy(FACE_NORMALS[selectedFace]).multiplyScalar(0.5 + dir*depth/2);
+}
+
+// ---------- aristas: 12 uniones entre caras no-opuestas, calculadas a partir de dims/offset ----------
+const EDGES = [];
+for (let i = 0; i < 6; i++) for (let j = i+1; j < 6; j++) { if (FACE_AXIS[i] !== FACE_AXIS[j]) EDGES.push([i,j]); }
+function edgeGeometryInfo(edge) {
+  const [i,j] = edge;
+  const nA = FACE_NORMALS[i], nB = FACE_NORMALS[j];
+  const axisA = FACE_AXIS[i], axisB = FACE_AXIS[j];
+  const axisDirName = ["x","y","z"].find(a => a !== axisA && a !== axisB);
+  const axisDir = axisDirName === "x" ? AX : axisDirName === "y" ? AY : AZ;
+  const center = new THREE.Vector3().addScaledVector(nA, dims[axisA]/2).addScaledVector(nB, dims[axisB]/2);
+  return { nA, nB, axisDir, center, length: dims[axisDirName], axisA, axisB };
+}
+function ensureEdgePickers() {
+  if (edgePickers) { cube.remove(edgePickers); edgePickers.children.forEach(c => { c.geometry.dispose(); c.material.dispose(); }); }
+  edgePickers = new THREE.Group();
+  EDGES.forEach((edge, idx) => {
+    const info = edgeGeometryInfo(edge);
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, info.length, 8),
+      new THREE.MeshBasicMaterial({ transparent:true, opacity:0 }));   // invisible pero SÍ raycasteable
+    m.quaternion.setFromUnitVectors(AY, info.axisDir);
+    m.position.copy(info.center);
+    m.userData.edgeIndex = idx;
+    edgePickers.add(m);
+  });
+  cube.add(edgePickers);
+}
+// aproximación visual: un "cordón" redondeado corriendo sobre la arista (geometría estándar,
+// sin math de fillet a medida) -> no es un chaflán exacto que recorta las dos caras, pero
+// redondea la silueta de forma confiable y sin riesgo de romper el resto del cubo.
+function setFilletRadius(r) {
+  filletRadius = r;
+  const info = edgeGeometryInfo(EDGES[selectedEdge]);
+  const geo = new THREE.CylinderGeometry(r, r, info.length, 16);
+  if (filletMesh) filletMesh.geometry.dispose();
+  else filletMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color:0x3f7fd0, metalness:0.35, roughness:0.35 }));
+  filletMesh.geometry = geo;
+  filletMesh.quaternion.setFromUnitVectors(AY, info.axisDir);
+  filletMesh.position.copy(info.center);
+  if (!filletMesh.parent) cube.add(filletMesh);
+}
+function clearFillet() {
+  if (filletMesh) { cube.remove(filletMesh); filletMesh.geometry.dispose(); filletMesh.material.dispose(); filletMesh = null; }
+  selectedEdge = -1;
+}
+
+function resetAll(){
+  objQuat.identity(); objScale=1; dims.x=dims.y=dims.z=1;
+  offset.x=offset.y=offset.z=0; selectedFace=-1; mode=null; dragRef=null;
+  sketchShape=null; featureDepth=0.02; drawing=false; filletRadius=0.02;
+  clearSketchMesh(); clearFeatureMesh(); clearFillet();
+  if (edgePickers) { cube.remove(edgePickers); edgePickers=null; }
+  strokes.length = 0; activePen.clear(); penLostAt.clear();
+}
+
+addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (k === "h") hudEl.classList.toggle("off");
+  if (k === "r") resetAll();
+  if (k === "v") setCamHidden(!camHidden);
+  if (e.key === "Escape") { mode = null; selectedFace = -1; selectedEdge = -1; sketchShape = null; clearSketchMesh(); clearFeatureMesh(); }
+});
+
+// ---------- botones en pantalla (responden al toque INSTANTÁNEO, sin temporizador) ----------
+const buttons = [
+  { id:"extrude", label:"EXTRUDE", color:"#6cf08a" },
+  { id:"cut",     label:"CUT",     color:"#ff8f6c" },
+  { id:"circle",  label:"CIRCLE",  color:"#7fd4ff" },
+  { id:"square",  label:"SQUARE",  color:"#7fd4ff" },
+  { id:"round",   label:"ROUND",   color:"#c792ff" },
+  { id:"draw",    label:"DRAW",    color:"#ffd166" }
+];
+function buttonRects() {
+  const W = stage.clientWidth, bw = Math.max(78, W*0.09), bh = 40, gap = 8;
+  const total = buttons.length*bw + (buttons.length-1)*gap;
+  let x = (W - total)/2;
+  return buttons.map(b => { const r = { ...b, x, y:16, w:bw, h:bh }; x += bw+gap; return r; });
+}
+function hitButton(px, py) {
+  return buttonRects().find(r => px>=r.x && px<=r.x+r.w && py>=r.y && py<=r.y+r.h) || null;
+}
+function drawButtons(hoverId) {
+  for (const r of buttonRects()) {
+    const active = (r.id==="extrude"||r.id==="cut"||r.id==="round") ? mode===r.id : r.id==="draw" ? drawing : sketchShape===r.id;
+    const hov = hoverId === r.id;
+    octx.beginPath();
+    octx.roundRect(r.x, r.y, r.w, r.h, 12);
+    octx.fillStyle = active ? r.color : hov ? "rgba(255,255,255,.22)" : "rgba(0,0,0,.45)";
+    octx.fill();
+    octx.lineWidth = active ? 3 : 2;
+    octx.strokeStyle = active ? "#ffffff" : r.color;
+    octx.stroke();
+    octx.fillStyle = active ? "#07110b" : "#e9f2ff";
+    octx.font = "600 12px system-ui"; octx.textAlign = "center"; octx.textBaseline = "middle";
+    octx.fillText(r.label, r.x + r.w/2, r.y + r.h/2);
+  }
+  octx.textAlign = "left"; octx.textBaseline = "alphabetic";
+}
+
+function handleButtonTap(id) {
+  if (id === "extrude" || id === "cut" || id === "round") {
+    mode = (mode === id) ? null : id;
+    drawing = false; dragRef = null;
+    if (mode === "round") ensureEdgePickers();
+    stateEl.textContent = mode ? `modo ${mode.toUpperCase()} activo` : "modo desactivado";
+  } else if (id === "circle" || id === "square") {
+    if (selectedFace < 0) { stateEl.textContent = "elegí una cara primero"; return; }
+    sketchShape = (sketchShape === id) ? null : id;
+    dragRef = null;
+    clearFeatureMesh();
+    featureDepth = 0.02;
+    updateSketchMesh();
+    stateEl.textContent = sketchShape ? `croquis ${id} en ${FACE_NAMES[selectedFace]}` : "croquis quitado";
+  } else if (id === "draw") {
+    drawing = !drawing;
+    if (drawing) { mode = null; dragRef = null; }
+    else { strokes.length = 0; activePen.clear(); penLostAt.clear(); }   // tocar DRAW de nuevo = borra todo
+    stateEl.textContent = drawing ? "✏️ modo dibujo — apuntá con el índice y arrastrá" : "dibujo borrado";
+  }
+}
+stage.addEventListener("click", e => {           // también clickeable con mouse
+  const b = stage.getBoundingClientRect();
+  const r = hitButton(e.clientX - b.left, e.clientY - b.top);
+  if (r) handleButtonTap(r.id);
+});
+
+// ---------- orientación 3D de la mano ----------
+const _v1=new THREE.Vector3(), _v2=new THREE.Vector3(), _xA=new THREE.Vector3(),
+      _yA=new THREE.Vector3(), _zA=new THREE.Vector3(), _m=new THREE.Matrix4();
+function handQuat(wl) {
+  const P = i => new THREE.Vector3(-wl[i].x, -wl[i].y, -wl[i].z);
+  const o = P(0);
+  _v1.copy(P(5)).sub(o); _v2.copy(P(17)).sub(o);
+  _zA.copy(_v1).cross(_v2).normalize();
+  _xA.copy(_v1).normalize();
+  _yA.copy(_zA).cross(_xA).normalize();
+  _xA.copy(_yA).cross(_zA).normalize();
+  _m.makeBasis(_xA,_yA,_zA);
+  return new THREE.Quaternion().setFromRotationMatrix(_m);
+}
+const _qd=new THREE.Quaternion(), _inv=new THREE.Quaternion();
+function applyHandDelta(qNow, qPrev) {
+  _inv.copy(qPrev).invert(); _qd.copy(qNow).multiply(_inv);
+  let angle = 2*Math.acos(THREE.MathUtils.clamp(Math.abs(_qd.w),-1,1));
+  if (angle < 1e-4 || angle > 0.6) return;
+  const s = Math.sqrt(1-_qd.w*_qd.w) || 1e-6;
+  const axis = new THREE.Vector3(_qd.x/s,_qd.y/s,_qd.z/s).normalize();
+  if (_qd.w < 0) axis.negate();
+  objQuat.premultiply(new THREE.Quaternion().setFromAxisAngle(axis, angle*ROT_GAIN));
+}
+
+const memory = new Map();
+let twoHandRef = null;
+
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]
+];
+function drawHand(lm, color, ptPx, active, radius) {
+  octx.strokeStyle = color; octx.lineWidth = active?4:2.5; octx.globalAlpha = active?1:.7;
+  for (const [a,b] of HAND_CONNECTIONS) {
+    const p = toPx(1-lm[a].x, lm[a].y), q = toPx(1-lm[b].x, lm[b].y);
+    octx.beginPath(); octx.moveTo(p.x,p.y); octx.lineTo(q.x,q.y); octx.stroke();
+  }
+  octx.fillStyle = color;
+  for (const l of lm) { const p = toPx(1-l.x,l.y);
+    octx.beginPath(); octx.arc(p.x,p.y, active?5:3.5,0,Math.PI*2); octx.fill(); }
+  octx.globalAlpha = 1;
+  octx.beginPath(); octx.arc(ptPx.x, ptPx.y, radius, 0, Math.PI*2);
+  octx.strokeStyle = color; octx.lineWidth = 3; octx.stroke();
+  if (active) { octx.globalAlpha=.3; octx.fillStyle=color; octx.fill(); octx.globalAlpha=1; }
+}
+
+// ---------- dibujo libre (modo DRAW): apuntar con el índice = lápiz abajo ----------
+// punta suavizada (TIP_SMOOTH) + distancia mínima entre puntos + tolerancia de 150ms si el
+// detector pierde el índice un instante -> mucho menos garabato/temblor que antes.
+function updateDrawing(hands, t) {
+  const seen = new Set();
+  for (const h of hands) {
+    seen.add(h.id);
+    const p = toPx(h.tipSmooth.mx, h.tipSmooth.my);
+    const overBtn = !!hitButton(p.x, p.y);       // no dibujar sobre la fila de botones
+    if (h.pointing && !overBtn) {
+      penLostAt.delete(h.id);
+      let s = activePen.get(h.id);
+      if (!s) { s = []; activePen.set(h.id, s); strokes.push(s); }
+      const last = s[s.length-1];
+      if (!last || Math.hypot(p.x-last.x, p.y-last.y) > DRAW_MIN_DIST) s.push(p);
+    } else if (activePen.has(h.id)) {
+      if (!penLostAt.has(h.id)) penLostAt.set(h.id, t);
+      if (t - penLostAt.get(h.id) > DRAW_GRACE_MS) { activePen.delete(h.id); penLostAt.delete(h.id); }
+    }
+  }
+  for (const id of [...activePen.keys()]) if (!seen.has(id)) { activePen.delete(id); penLostAt.delete(id); }
+}
+function drawStrokes() {
+  octx.lineCap = "round"; octx.lineJoin = "round";
+  octx.strokeStyle = "#ffd166"; octx.lineWidth = 4; octx.globalAlpha = 0.95;
+  for (const s of strokes) {
+    if (s.length < 2) continue;
+    octx.beginPath(); octx.moveTo(s[0].x, s[0].y);
+    if (s.length === 2) octx.lineTo(s[1].x, s[1].y);
+    else {
+      for (let i=1;i<s.length-1;i++) {
+        const mx=(s[i].x+s[i+1].x)/2, my=(s[i].y+s[i+1].y)/2;
+        octx.quadraticCurveTo(s[i].x, s[i].y, mx, my);   // curva suave en vez de segmentos rectos
+      }
+      octx.lineTo(s[s.length-1].x, s[s.length-1].y);
+    }
+    octx.stroke();
+  }
+  octx.globalAlpha = 1;
+}
+
+const _off = new THREE.Vector3();
+function render() {
+  requestAnimationFrame(render);
+  shownScale += (objScale - shownScale)*0.25;
+  cube.quaternion.slerp(objQuat, 0.5);
+  cube.scale.set(dims.x*shownScale, dims.y*shownScale, dims.z*shownScale);
+  _off.set(offset.x, offset.y, offset.z).applyQuaternion(cube.quaternion).multiplyScalar(shownScale);
+  cube.position.copy(_off);
+  faceMats.forEach((m,i) => {
+    const sel = i===selectedFace, hov = i===hoverFace;
+    m.color.setHex(sel ? 0x2fbf5f : 0x3f7fd0);
+    m.emissive.setHex(sel ? (mode==="cut"?0x6e2f1c:0x1f7a3d) : hov ? 0x24425e : 0x000000);
+  });
+  renderer.render(scene, camera);
+}
+render();
+
+const raycaster = new THREE.Raycaster();
+let dwellTarget = null, dwellSince = 0, dwellFired = false, lastBtnHover = null;
+
+async function main() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const landmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                  delegate:"GPU" },
+    runningMode:"VIDEO", numHands:2 });
+
+  video.srcObject = await navigator.mediaDevices.getUserMedia({
+    video:{ width:CAM_W, height:CAM_H }, audio:false });
+  await new Promise(r => video.onloadedmetadata = r);
+  video.play(); layout();
+
+  let last = -1;
+  function loop() {
+    if (video.currentTime !== last) {
+      last = video.currentTime;
+      const t = performance.now();
+      const res = landmarker.detectForVideo(video, t);
+      octx.clearRect(0,0,stage.clientWidth, stage.clientHeight);
+
+      const handed = res.handednesses || res.handedness || [];
+      const wls = res.worldLandmarks || [];
+      const hands = (res.landmarks || []).map((lm,i) => {
+        const id = handed[i]?.[0]?.categoryName || ("h"+i);
+        const pinchN = pinchRatio(lm, wls[i]);
+        let mx = 1-(lm[4].x+lm[8].x)/2, my = (lm[4].y+lm[8].y)/2;
+        let tmx = 1-lm[8].x, tmy = lm[8].y;
+        const mem = memory.get(id);
+        if (mem?.sx !== undefined) { mx = mem.sx+(mx-mem.sx)*SMOOTH; my = mem.sy+(my-mem.sy)*SMOOTH; }
+        if (mem?.tx !== undefined) { tmx = mem.tx+(tmx-mem.tx)*TIP_SMOOTH; tmy = mem.ty+(tmy-mem.ty)*TIP_SMOOTH; }
+        const ext = (tip,pip) => Math.hypot(lm[tip].x-lm[0].x, lm[tip].y-lm[0].y) >
+                                 Math.hypot(lm[pip].x-lm[0].x, lm[pip].y-lm[0].y);
+        const pointing = ext(8,6) && !ext(12,10) && !ext(16,14) && !ext(20,18);
+        return { id, lm, pinchN, mx, my, pointing, tip:{ mx:1-lm[8].x, my:lm[8].y }, tipSmooth:{ mx:tmx, my:tmy },
+                 quat: wls[i] ? handQuat(wls[i]) : null,
+                 world: toWorld(mx,my), px: toPx(mx,my) };
+      });
+
+      const reach = 0.75*shownScale + REACH_PAD;
+      const center = { x:cube.position.x, y:cube.position.y };
+      const live = [];
+      for (const h of hands) {
+        const prev = memory.get(h.id), was = prev?.grabbing || false;
+        h.near = Math.hypot(h.world.x-center.x, h.world.y-center.y) < reach;
+        h.grabbing = was ? h.pinchN < GRAB_OFF : (h.pinchN < GRAB_ON && h.near);
+        if (h.grabbing) live.push(h);
+      }
+
+      if (drawing) {
+        twoHandRef = null; dragRef = null;
+        updateDrawing(hands, t);
+        stateEl.textContent = "✏️ modo dibujo — apuntá con el índice y arrastrá · tocá DRAW para salir y borrar";
+      } else {
+        const editingFace = mode && mode !== "round" && selectedFace >= 0;
+        const editingEdge  = mode === "round" && selectedEdge >= 0;
+
+        if (live.length === 1) {
+          twoHandRef = null;
+          const h = live[0], prev = memory.get(h.id);
+
+          if (editingFace) {
+            const n = FACE_NORMALS[selectedFace].clone().applyQuaternion(cube.quaternion);
+            let dir = new THREE.Vector2(n.x, n.y);
+            if (dir.length() < 0.3) dir.set(0,1); else dir.normalize();
+            const proj = h.world.x*dir.x + h.world.y*dir.y;
+
+            if (sketchShape) {
+              // ---- extrude/cut SOBRE EL CROQUIS: agrega o quita material solo ahí ----
+              const kind = mode === "extrude" ? "boss" : "pocket";
+              ensureFeatureMesh(kind);
+              if (!dragRef) dragRef = { proj0: proj, depth0: featureDepth };
+              else {
+                const maxD = mode === "extrude" ? BOSS_MAX : dims[FACE_AXIS[selectedFace]]*0.85;
+                const raw = dragRef.depth0 + (proj - dragRef.proj0) * DRAG_GAIN / Math.max(shownScale, 1e-3);
+                setFeatureDepth(THREE.MathUtils.clamp(raw, 0.02, maxD));
+              }
+              const verb = mode === "extrude" ? "extruyendo croquis" : "cortando croquis";
+              stateEl.textContent = `⬍ ${verb} · profundidad ${featureDepth.toFixed(2)}`;
+            } else {
+              // ---- whole-face: extrude/cut de la cara completa ----
+              const axis = FACE_AXIS[selectedFace], sign = FACE_SIGN[selectedFace];
+              if (!dragRef) dragRef = { proj0: proj, dim0: dims[axis] };
+              else {
+                const delta = (proj - dragRef.proj0) * DRAG_GAIN / Math.max(shownScale, 1e-3);
+                const raw = dragRef.dim0 + delta;
+                const next = mode === "extrude"
+                  ? THREE.MathUtils.clamp(raw, dragRef.dim0, DIM_MAX)
+                  : THREE.MathUtils.clamp(raw, DIM_MIN, dragRef.dim0);
+                offset[axis] += sign*(next - dims[axis])/2;
+                dims[axis] = next;
+              }
+              const verb = mode === "extrude" ? "extruyendo" : "cortando";
+              stateEl.textContent = `⬍ ${verb} ${FACE_NAMES[selectedFace]} · ` +
+                `${dims.x.toFixed(2)} × ${dims.y.toFixed(2)} × ${dims.z.toFixed(2)}`;
+            }
+          } else if (editingEdge) {
+            const info = edgeGeometryInfo(EDGES[selectedEdge]);
+            const bis = info.nA.clone().add(info.nB).normalize().applyQuaternion(cube.quaternion);
+            let dir2 = new THREE.Vector2(bis.x, bis.y);
+            if (dir2.length() < 0.3) dir2.set(0,1); else dir2.normalize();
+            const proj = h.world.x*dir2.x + h.world.y*dir2.y;
+            if (!dragRef) dragRef = { proj0: proj, r0: filletRadius };
+            else {
+              const maxR = Math.min(dims[info.axisA], dims[info.axisB]) * 0.48;
+              const raw = dragRef.r0 + (proj - dragRef.proj0) * DRAG_GAIN / Math.max(shownScale, 1e-3);
+              setFilletRadius(THREE.MathUtils.clamp(raw, 0.01, maxR));
+            }
+            stateEl.textContent = `⬍ redondeando arista · radio ${filletRadius.toFixed(2)}`;
+          } else {
+            dragRef = null;
+            if (prev?.grabbing && prev.quat && h.quat) applyHandDelta(h.quat, prev.quat);
+            stateEl.textContent = "✊ girando con una mano";
+          }
+        }
+        else if (live.length >= 2) {
+          dragRef = null;
+          const a = live[0], b = live[1];
+          const dist = Math.hypot(a.world.x-b.world.x, a.world.y-b.world.y);
+          const ang  = Math.atan2(b.world.y-a.world.y, b.world.x-a.world.x);
+          const midX = (a.world.x+b.world.x)/2, midY = (a.world.y+b.world.y)/2;
+          if (!twoHandRef) twoHandRef = { ang, midX, midY, scale:objScale, d0:dist };
+          else {
+            objScale = THREE.MathUtils.clamp(twoHandRef.scale*(dist/twoHandRef.d0), 0.25, 3.5);
+            spin(AZ, -angleDelta(ang, twoHandRef.ang));
+            spin(AY,  dz(midX-twoHandRef.midX)*TWO_GAIN);
+            spin(AX, -dz(midY-twoHandRef.midY)*TWO_GAIN);
+            twoHandRef.ang = ang; twoHandRef.midX = midX; twoHandRef.midY = midY;
+          }
+          stateEl.textContent = "🤲 dos manos · " + (dist > twoHandRef.d0 ? "estirando" : "encogiendo");
+        }
+        else { twoHandRef = null; dragRef = null; }
+      }
+
+      // ---------- apuntar: botones disparan al toque, caras/aristas usan un breve dwell ----------
+      hoverFace = -1; hoverEdge = -1;
+      let hoverBtn = null, dwellProgress = 0;
+      if (drawing || !live.length) {
+        const p = hands.find(h => h.pointing);
+        let target = null;
+        if (p) {
+          const tipPx = toPx(p.tip.mx, p.tip.my);
+          const btn = hitButton(tipPx.x, tipPx.y);
+          if (btn) {
+            hoverBtn = btn.id;
+            if (lastBtnHover !== btn.id) { lastBtnHover = btn.id; handleButtonTap(btn.id); }
+          } else {
+            lastBtnHover = null;
+            const ndc = new THREE.Vector2(p.tip.mx*2-1, -(p.tip.my*2-1));
+            raycaster.setFromCamera(ndc, camera);
+            if (mode === "round" && edgePickers) {
+              const hit = raycaster.intersectObjects(edgePickers.children, false)[0];
+              if (hit) { hoverEdge = hit.object.userData.edgeIndex; target = "edge:"+hoverEdge; }
+            } else if (!drawing) {
+              const hit = raycaster.intersectObject(cube, false)[0];
+              if (hit) { hoverFace = hit.face.materialIndex; target = "face:"+hoverFace; }
+            }
+          }
+        } else lastBtnHover = null;
+
+        if (target !== dwellTarget) { dwellTarget = target; dwellSince = t; dwellFired = false; }
+        if (target && !dwellFired) {
+          dwellProgress = Math.min(1, (t - dwellSince)/TAP_MS);
+          if (dwellProgress >= 1) {
+            dwellFired = true;
+            if (target.startsWith("edge:")) {
+              const e = +target.slice(5);
+              selectedEdge = (selectedEdge === e) ? -1 : e;
+              dragRef = null;
+              stateEl.textContent = selectedEdge>=0 ? "🟢 arista seleccionada — pinza y arrastrá" : "arista deseleccionada";
+            } else {
+              const f = +target.slice(5);
+              selectedFace = (selectedFace === f) ? -1 : f;
+              sketchShape = null; clearSketchMesh(); clearFeatureMesh(); dragRef = null;
+              stateEl.textContent = selectedFace>=0 ? "🟢 cara: " + FACE_NAMES[selectedFace] : "cara deseleccionada";
+            }
+          } else {
+            const c = toPx(p.tip.mx, p.tip.my);
+            octx.strokeStyle = "rgba(108,240,138,.9)"; octx.lineWidth = 4;
+            octx.beginPath(); octx.arc(c.x,c.y,20,-Math.PI/2,-Math.PI/2+dwellProgress*Math.PI*2);
+            octx.stroke();
+            stateEl.textContent = target.startsWith("edge:") ? "👆 arista…" : "👆 cara " + FACE_NAMES[hoverFace] + "…";
+          }
+        }
+        if (!drawing && !target && !hoverBtn && !live.length)
+          stateEl.textContent = mode
+            ? (mode === "round"
+                ? (selectedEdge<0 ? "modo ROUND — tocá una arista con el índice · ESC para salir"
+                                  : "modo ROUND — pinza y arrastrá · ESC para salir")
+                : (selectedFace<0 ? `modo ${mode.toUpperCase()} — elegí una cara con el índice · ESC para salir`
+                                  : `modo ${mode.toUpperCase()} — pinza y arrastrá · ESC para salir`))
+            : (hands.some(h=>h.near) ? "✋ pinza para girar · índice para tocar" : "acercá la mano");
+        if (!hands.length) stateEl.textContent = "sin manos";
+      } else { dwellTarget = null; dwellFired = false; lastBtnHover = null; }
+
+      drawButtons(hoverBtn);
+
+      // flecha de dirección sobre la cara en edición (solo whole-face; el croquis ya se ve solo)
+      if (!drawing && mode && mode !== "round" && selectedFace >= 0 && !sketchShape) {
+        const n = FACE_NORMALS[selectedFace].clone().applyQuaternion(cube.quaternion);
+        const half = dims[FACE_AXIS[selectedFace]]/2*shownScale;
+        const base = n.clone().multiplyScalar(half).add(cube.position);
+        const tipW = n.clone().multiplyScalar(half + 0.45*shownScale).add(cube.position);
+        const b2 = worldToPx(base), t2 = worldToPx(tipW);
+        octx.strokeStyle = mode==="cut" ? "#ff8f6c" : "#6cf08a";
+        octx.lineWidth = 3; octx.setLineDash([7,5]);
+        octx.beginPath(); octx.moveTo(b2.x,b2.y); octx.lineTo(t2.x,t2.y); octx.stroke();
+        octx.setLineDash([]);
+        octx.beginPath(); octx.arc(t2.x,t2.y,6,0,Math.PI*2);
+        octx.fillStyle = mode==="cut" ? "#ff8f6c" : "#6cf08a"; octx.fill();
+      }
+
+      if (!drawing && hands.length && !live.length && hoverFace < 0 && hoverEdge < 0 && !hoverBtn) {
+        const c = worldToPx(cube.position), rPx = (reach/visW)*stage.clientWidth;
+        octx.strokeStyle = "rgba(127,212,255,.25)"; octx.lineWidth = 2; octx.setLineDash([5,7]);
+        octx.beginPath(); octx.arc(c.x,c.y,rPx,0,Math.PI*2); octx.stroke(); octx.setLineDash([]);
+      }
+
+      drawStrokes();
+
+      for (const h of hands) {
+        const color = drawing ? (h.pointing ? "#ffd166" : "#93a0b4")
+                    : h.grabbing ? ((mode && (sketchShape || mode==="round")) ? "#ffd166" : "#6cf08a")
+                    : h.pointing ? "#ffd166" : h.near ? "#7fd4ff" : "#93a0b4";
+        const pt = h.pointing && !h.grabbing ? toPx(h.tip.mx, h.tip.my) : h.px;
+        drawHand(h.lm, color, pt, h.grabbing || (drawing && h.pointing), h.grabbing?15 : h.pointing?12 : 9);
+      }
+
+      for (const h of hands)
+        memory.set(h.id, { world:h.world, quat:h.quat, grabbing:h.grabbing,
+                           sx:h.mx, sy:h.my, tx:h.tipSmooth.mx, ty:h.tipSmooth.my, seen:t });
+      for (const [id,m] of memory)
+        if (!hands.some(h=>h.id===id) && t-m.seen > GRACE_MS) memory.delete(id);
+    }
+    requestAnimationFrame(loop);
+  }
+  loop();
+}
+
+main().catch(e => { stateEl.textContent = "error: "+e.message; console.error(e); });
+</script>
+</body>
+</html>
